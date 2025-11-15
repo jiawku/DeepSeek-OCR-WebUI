@@ -1468,6 +1468,9 @@
                         <button class="btn btn-primary" id="downloadBtn">
                             <span>⬇️</span> 下载文本
                         </button>
+                        <button class="btn btn-secondary" id="downloadSearchablePdfBtn" disabled>
+                            <span>📄</span> 下载可搜索 PDF
+                        </button>
                     </div>
                 </div>
                 <div class="result-text" id="resultText"></div>
@@ -2008,6 +2011,7 @@
             resultText: document.getElementById('resultText'),
             copyBtn: document.getElementById('copyBtn'),
             downloadBtn: document.getElementById('downloadBtn'),
+            downloadSearchablePdfBtn: document.getElementById('downloadSearchablePdfBtn'),
             toast: document.getElementById('toast'),
             toastIcon: document.getElementById('toastIcon'),
             toastMessage: document.getElementById('toastMessage'),
@@ -2044,6 +2048,8 @@
                 'Formats': 'Images: JPG, PNG, JPEG, BMP, GIF, WEBP | PDF',
                 'Modes': '7 recognition modes available'
             });
+
+            updateUI();
         }
 
         // Add Log Entry (增强版)
@@ -2094,7 +2100,10 @@
                 'PDF 转换成功': 'PDF Converted',
                 '重置 Find 模式': 'Find Mode Reset',
                 '开始查找': 'Find Started',
-                '✓ 查找成功': '✓ Find Success'
+                '✓ 查找成功': '✓ Find Success',
+                '生成搜索 PDF': 'Searchable PDF Generation',
+                '生成搜索 PDF 成功': 'Searchable PDF Success',
+                '生成搜索 PDF 失败': 'Searchable PDF Failed'
             };
 
             // 转换消息为英文
@@ -2464,7 +2473,9 @@
                         result: null,
                         isFromPDF: true,
                         originalPDF: pdfFile.name,
-                        pageNumber: imgData.page_number
+                        pageNumber: imgData.page_number,
+                        width: imgData.width,
+                        height: imgData.height
                     });
                     
                     // 实时更新UI（每处理几页更新一次，避免过于频繁）
@@ -2603,6 +2614,7 @@
         // Remove Image
         window.removeImage = function(id) {
             state.images = state.images.filter(img => img.id != id);
+            state.results = state.results.filter(result => result.id != id);
             renderImages();
             updateUI();
             showToast('已移除图片', 'info');
@@ -2615,6 +2627,9 @@
             elements.clearBtn.addEventListener('click', clearAll);
             elements.copyBtn.addEventListener('click', copyResult);
             elements.downloadBtn.addEventListener('click', downloadResult);
+            if (elements.downloadSearchablePdfBtn) {
+                elements.downloadSearchablePdfBtn.addEventListener('click', downloadSearchablePDF);
+            }
             
             // 单图模式按钮
             document.getElementById('processSingleBtn').addEventListener('click', processSingleImage);
@@ -2770,19 +2785,35 @@
                 });
 
                 try {
-                    const result = await processImage(image);
+                    const resultData = await processImage(image);
                     const processingTime = ((Date.now() - imageStartTime) / 1000).toFixed(1);
-                    
+
                     image.status = 'completed';
-                    image.result = result;
+                    image.result = resultData.text;
+                    image.rawText = resultData.rawText;
+                    if (resultData.boxes && resultData.boxes.length > 0) {
+                        image.boxes = resultData.boxes;
+                    }
+                    if (resultData.imageDims) {
+                        image.imageDims = resultData.imageDims;
+                    }
+
                     state.results.push({
+                        id: image.id,
                         name: image.name,
-                        text: result
+                        text: resultData.text,
+                        rawText: resultData.rawText,
+                        boxes: resultData.boxes,
+                        imageDims: resultData.imageDims,
+                        originalPDF: image.originalPDF || null,
+                        pageNumber: image.pageNumber || null,
+                        width: image.width || (resultData.imageDims ? resultData.imageDims.w : null) || null,
+                        height: image.height || (resultData.imageDims ? resultData.imageDims.h : null) || null
                     });
                     succeeded++;
-                    
-                    const textLength = result.length;
-                    const wordCount = result.split(/\s+/).length;
+
+                    const textLength = resultData.text.length;
+                    const wordCount = resultData.text.split(/\s+/).length;
                     
                     addLog(`✓ 识别成功 [${i + 1}/${total}]`, 'success', `${image.name} 处理完成`, {
                         '处理时间': `${processingTime} 秒`,
@@ -2810,6 +2841,7 @@
                 processed++;
                 updateProgress(processed, total);
                 renderImages();
+                updateUI();
             }
 
             const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -2818,7 +2850,7 @@
             state.isProcessing = false;
             showResult();
             showToast('所有图片识别完成！', 'success');
-            
+
             addLog('批量识别完成', 'success', `所有图片处理完毕，结果已生成`, {
                 '总数量': `${total} 张`,
                 '成功': `${succeeded} 张`,
@@ -2828,6 +2860,8 @@
                 '识别模式': getModeDisplayName(state.mode),
                 '结果长度': `${state.results.reduce((sum, r) => sum + r.text.length, 0)} 字符`
             });
+
+            updateUI();
         }
 
         // Process Single Image
@@ -2862,14 +2896,27 @@
             if (!data.success) {
                 throw new Error(data.error || '识别失败');
             }
-            
-            // 如果有 boxes 信息，保存到 image 对象中
-            if (data.boxes && data.boxes.length > 0) {
-                image.boxes = data.boxes;
-                image.imageDims = data.image_dims;
+
+            const rawText = typeof data.raw_text === 'string' ? data.raw_text : '';
+            const boxes = Array.isArray(data.boxes) ? data.boxes : [];
+            const imageDims = data.image_dims || null;
+
+            if (boxes.length > 0) {
+                image.boxes = boxes;
+                image.imageDims = imageDims;
+            } else {
+                delete image.boxes;
+                delete image.imageDims;
             }
 
-            return data.text;
+            image.rawText = rawText;
+
+            return {
+                text: data.text || '',
+                rawText,
+                boxes,
+                imageDims
+            };
         }
 
         // Draw Bounding Boxes on Canvas（边界框绘制函数）
@@ -3126,6 +3173,153 @@
             });
         }
 
+        async function downloadSearchablePDF() {
+            if (state.isProcessing) {
+                showToast('请等待识别完成后再生成 PDF', 'info');
+                return;
+            }
+
+            const pdfPages = state.images.filter(img => img.isFromPDF);
+            if (pdfPages.length === 0) {
+                showToast('当前没有可生成的 PDF 页面', 'error');
+                addLog('生成搜索 PDF 失败', 'error', '未检测到来自 PDF 的页面');
+                return;
+            }
+
+            const incompletePages = pdfPages.filter(img => img.status !== 'completed');
+            if (incompletePages.length > 0) {
+                showToast('请先完成所有 PDF 页面的识别', 'warning');
+                addLog('生成搜索 PDF 失败', 'warning', '仍有页面未识别完成', {
+                    '未完成页数': `${incompletePages.length} 页`
+                });
+                return;
+            }
+
+            const pagesWithResults = pdfPages.map(img => {
+                const result = state.results.find(r => r.id === img.id);
+                if (!result || !result.text) {
+                    return null;
+                }
+
+                const derivedWidth = img.width || (result.imageDims ? result.imageDims.w : null) || (img.imageDims ? img.imageDims.w : null) || null;
+                const derivedHeight = img.height || (result.imageDims ? result.imageDims.h : null) || (img.imageDims ? img.imageDims.h : null) || null;
+                const boxes = (result.boxes && result.boxes.length > 0)
+                    ? result.boxes
+                    : (img.boxes || []);
+                const rawText = result.rawText || img.rawText || '';
+                const imageDims = result.imageDims || img.imageDims || (derivedWidth && derivedHeight ? { w: derivedWidth, h: derivedHeight } : null);
+
+                return {
+                    id: img.id,
+                    pageNumber: img.pageNumber,
+                    originalPDF: img.originalPDF,
+                    preview: img.preview,
+                    width: derivedWidth,
+                    height: derivedHeight,
+                    text: result.text,
+                    rawText,
+                    boxes,
+                    imageDims
+                };
+            }).filter(Boolean);
+
+            if (pagesWithResults.length !== pdfPages.length) {
+                showToast('部分页面缺少识别结果，请重新识别', 'error');
+                addLog('生成搜索 PDF 失败', 'error', '部分页面没有识别文本，无法生成 PDF');
+                return;
+            }
+
+            const sortedPages = [...pagesWithResults];
+            if (sortedPages.every(p => typeof p.pageNumber === 'number')) {
+                sortedPages.sort((a, b) => (a.pageNumber || 0) - (b.pageNumber || 0));
+            }
+
+            const payload = {
+                pages: sortedPages.map(page => {
+                    const imageData = page.preview.startsWith('data:') ? page.preview.split(',')[1] : page.preview;
+                    const payloadPage = {
+                        image_data: imageData,
+                        text: page.text,
+                        raw_text: page.rawText || '',
+                        page_number: page.pageNumber,
+                        width: page.width,
+                        height: page.height
+                    };
+
+                    if (page.boxes && page.boxes.length > 0) {
+                        payloadPage.boxes = page.boxes;
+                    }
+
+                    if (page.imageDims) {
+                        payloadPage.image_dims = page.imageDims;
+                    } else if (page.width && page.height) {
+                        payloadPage.image_dims = { w: page.width, h: page.height };
+                    }
+
+                    return payloadPage;
+                }),
+                original_filename: sortedPages[0].originalPDF || 'document.pdf',
+                title: sortedPages[0].originalPDF ? sortedPages[0].originalPDF.replace(/\.pdf$/i, '') : 'OCR Document'
+            };
+
+            showToast('正在生成可搜索 PDF...', 'info');
+            addLog('生成搜索 PDF', 'info', '正在生成可搜索 PDF 文件', {
+                '原始文件': payload.original_filename,
+                '页面数量': `${sortedPages.length} 页`
+            });
+
+            try {
+                const response = await fetch(`${CONFIG.apiUrl}/generate-searchable-pdf`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(errorText || '生成 PDF 失败');
+                }
+
+                const blob = await response.blob();
+                const downloadUrl = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+
+                const disposition = response.headers.get('Content-Disposition');
+                let filename = 'searchable.pdf';
+                if (disposition) {
+                    const match = disposition.match(/filename\*=UTF-8''([^;]+)/);
+                    if (match && match[1]) {
+                        filename = decodeURIComponent(match[1]);
+                    } else {
+                        const simpleMatch = disposition.match(/filename="?([^";]+)"?/);
+                        if (simpleMatch && simpleMatch[1]) {
+                            filename = simpleMatch[1];
+                        }
+                    }
+                } else if (payload.original_filename) {
+                    filename = payload.original_filename.replace(/\.pdf$/i, '') + '_searchable.pdf';
+                }
+
+                link.href = downloadUrl;
+                link.download = filename;
+                link.style.display = 'none';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(downloadUrl);
+
+                showToast('可搜索 PDF 已下载', 'success');
+                addLog('生成搜索 PDF 成功', 'success', `文件已下载: ${filename}`, {
+                    '文件名': filename,
+                    '页面数量': `${sortedPages.length} 页`
+                });
+            } catch (error) {
+                console.error('生成可搜索 PDF 失败:', error);
+                showToast(`生成 PDF 失败: ${error.message}`, 'error');
+                addLog('生成搜索 PDF 失败', 'error', error.message);
+            }
+        }
+
         // Clear All
         function clearAll() {
             if (!confirm('确定要清空所有图片吗？')) return;
@@ -3157,6 +3351,13 @@
             elements.imageCount.textContent = state.images.length;
             elements.processBtn.disabled = state.isProcessing || !hasImages;
             elements.clearBtn.disabled = state.isProcessing || !hasImages;
+
+            if (elements.downloadSearchablePdfBtn) {
+                const pdfPages = state.images.filter(img => img.isFromPDF);
+                const canGenerate = !state.isProcessing && pdfPages.length > 0 && pdfPages.every(img => img.status === 'completed');
+                elements.downloadSearchablePdfBtn.disabled = !canGenerate;
+                elements.downloadSearchablePdfBtn.style.display = pdfPages.length > 0 ? 'inline-flex' : 'none';
+            }
         }
 
         // Setup Drag and Drop (not for reordering, but for new file drop)

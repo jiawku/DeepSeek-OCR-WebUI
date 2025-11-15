@@ -11,18 +11,21 @@ import shutil
 import io
 import base64
 import time
+import binascii
+import urllib.parse
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps
 import torch
 from transformers import AutoModel, AutoTokenizer
 import uvicorn
 import fitz  # PyMuPDF
+from pydantic import BaseModel
 
 # 全局变量
 model = None
@@ -458,6 +461,196 @@ async def ocr_endpoint(
             shutil.rmtree(output_dir, ignore_errors=True)
             print(f"🗑️ 输出目录已清理: {output_dir}")
 
+
+class SearchablePDFPage(BaseModel):
+    image_data: str
+    text: Optional[str] = ""
+    raw_text: Optional[str] = ""
+    page_number: Optional[int] = None
+    width: Optional[float] = None
+    height: Optional[float] = None
+    boxes: Optional[List[Dict[str, Any]]] = None
+    image_dims: Optional[Dict[str, Any]] = None
+
+
+class SearchablePDFRequest(BaseModel):
+    pages: List[SearchablePDFPage]
+    title: Optional[str] = None
+    original_filename: Optional[str] = None
+
+
+def sanitize_filename(filename: Optional[str], default: str = "document.pdf") -> str:
+    if not filename:
+        filename = default
+    filename = filename.replace("\x00", "").strip()
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", filename)
+    cleaned = cleaned or default
+    if len(cleaned) > 150:
+        base, ext = os.path.splitext(cleaned)
+        cleaned = base[:150 - len(ext)] + ext
+    return cleaned
+
+
+def decode_base64_image(data: str) -> bytes:
+    if not data:
+        raise ValueError("图像数据为空")
+    payload = data.split(",", 1)[1] if "," in data else data
+    payload = payload.strip()
+    try:
+        return base64.b64decode(payload)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"图像数据解码失败: {exc}") from exc
+
+
+def _to_float(value: Any) -> Optional[float]:
+    """尝试将任意值转换为浮点数，失败则返回 None。"""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def create_searchable_pdf_document(payload: SearchablePDFRequest) -> bytes:
+    if not payload.pages:
+        raise ValueError("缺少页面数据，无法生成 PDF")
+
+    document = fitz.open()
+    try:
+        for idx, page in enumerate(payload.pages):
+            image_bytes = decode_base64_image(page.image_data)
+
+            dims = page.image_dims or {}
+            width_value = _to_float(page.width) or _to_float(dims.get("w"))
+            height_value = _to_float(page.height) or _to_float(dims.get("h"))
+
+            if width_value is None or height_value is None:
+                try:
+                    with Image.open(io.BytesIO(image_bytes)) as pil_img:
+                        width_value = width_value or float(pil_img.width)
+                        height_value = height_value or float(pil_img.height)
+                except Exception:
+                    pass
+
+            if width_value is None:
+                width_value = 595.0  # A4 默认宽度 (pt)
+            if height_value is None:
+                height_value = 842.0  # A4 默认高度 (pt)
+
+            page_width = max(int(round(width_value)), 1)
+            page_height = max(int(round(height_value)), 1)
+
+            pdf_page = document.new_page(width=width_value, height=height_value)
+            rect = fitz.Rect(0, 0, width_value, height_value)
+            pdf_page.insert_image(rect, stream=image_bytes)
+
+            text_content = (page.text or "").strip()
+            raw_text = (page.raw_text or "").strip()
+
+            detection_boxes: List[Dict[str, Any]] = []
+            if raw_text and "<|det|>" in raw_text:
+                try:
+                    detection_boxes = parse_detections(raw_text, page_width, page_height)
+                except Exception as parse_exc:
+                    print(f"⚠️ 解析检测框失败: {parse_exc}")
+
+            if not detection_boxes and page.boxes:
+                for box in page.boxes:
+                    if not isinstance(box, dict):
+                        continue
+                    label = str(box.get("label", "")).strip()
+                    coords = box.get("box")
+                    if not coords or len(coords) < 4:
+                        continue
+                    try:
+                        x1, y1, x2, y2 = [float(coords[i]) for i in range(4)]
+                    except (TypeError, ValueError):
+                        continue
+                    detection_boxes.append({
+                        "label": label,
+                        "box": [x1, y1, x2, y2]
+                    })
+
+            inserted_regions = 0
+            if detection_boxes:
+                for det in detection_boxes:
+                    label = str(det.get("label", "")).strip()
+                    coords = det.get("box") or []
+                    if not label or len(coords) < 4:
+                        continue
+
+                    try:
+                        x1, y1, x2, y2 = [float(coords[i]) for i in range(4)]
+                    except (TypeError, ValueError):
+                        continue
+
+                    x1 = max(0.0, min(x1, width_value))
+                    y1 = max(0.0, min(y1, height_value))
+                    x2 = max(0.0, min(x2, width_value))
+                    y2 = max(0.0, min(y2, height_value))
+
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+
+                    rect_box = fitz.Rect(x1, y1, x2, y2)
+                    if rect_box.width <= 0 or rect_box.height <= 0:
+                        continue
+
+                    fontsize = max(4.0, min(rect_box.height * 0.9, 24.0))
+                    normalized_text = re.sub(r"\s+", " ", label).strip()
+
+                    pdf_page.insert_textbox(
+                        rect_box,
+                        normalized_text,
+                        fontsize=fontsize,
+                        fontname="helv",
+                        color=(0, 0, 0),
+                        render_mode=3,
+                        align=fitz.TEXT_ALIGN_LEFT,
+                        overlay=False
+                    )
+                    inserted_regions += 1
+
+            if inserted_regions == 0 and text_content:
+                pdf_page.insert_textbox(
+                    rect,
+                    text_content,
+                    fontsize=12,
+                    fontname="helv",
+                    color=(0, 0, 0),
+                    render_mode=3,
+                    overlay=False
+                )
+
+            if inserted_regions > 0:
+                print(f"🧾 可搜索 PDF - 第 {idx + 1} 页插入 {inserted_regions} 个文本区域 (尺寸: {width_value}x{height_value})")
+            else:
+                print(f"🧾 可搜索 PDF - 已处理第 {idx + 1} 页 (尺寸: {width_value}x{height_value})")
+
+        metadata_title = payload.title or payload.original_filename or "Searchable Document"
+        document.set_metadata({
+            "title": metadata_title,
+            "producer": "DeepSeek OCR WebUI",
+            "creator": "DeepSeek OCR WebUI"
+        })
+
+        buffer = io.BytesIO()
+        document.save(buffer, garbage=4, deflate=True)
+        buffer.seek(0)
+        return buffer.getvalue()
+    finally:
+        document.close()
+
+
+def build_searchable_pdf_filename(original_filename: Optional[str]) -> str:
+    base_name = sanitize_filename(original_filename) if original_filename else "document.pdf"
+    if not base_name.lower().endswith('.pdf'):
+        base_name += '.pdf'
+    base_name = re.sub(r"(?i)\.pdf$", "", base_name)
+    return f"{base_name}_searchable.pdf"
+
+
 def pdf_to_images(pdf_path: str, dpi: int = 144) -> List[Image.Image]:
     """
     将 PDF 转换为图片列表
@@ -608,9 +801,41 @@ async def pdf_to_images_endpoint(file: UploadFile = File(...)):
             except Exception as e:
                 print(f"⚠️ 删除临时文件失败: {e}")
 
+
+@app.post("/generate-searchable-pdf")
+async def generate_searchable_pdf_endpoint(payload: SearchablePDFRequest):
+    """生成带有 OCR 文本层的可搜索 PDF。"""
+
+    print(f"🧾 接收到生成可搜索 PDF 请求，页面数量: {len(payload.pages)}")
+
+    try:
+        pdf_bytes = create_searchable_pdf_document(payload)
+    except ValueError as e:
+        print(f"❌ 可搜索 PDF 生成失败: {e}")
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"❌ 可搜索 PDF 生成异常:\n{error_detail}")
+        raise HTTPException(status_code=500, detail=f"生成 PDF 失败: {str(e)}") from e
+
+    download_name = build_searchable_pdf_filename(payload.original_filename)
+    encoded_name = urllib.parse.quote(download_name)
+
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"
+    }
+
+    print(f"✅ 可搜索 PDF 生成成功: {download_name}")
+
+    stream = io.BytesIO(pdf_bytes)
+    stream.seek(0)
+    return StreamingResponse(stream, media_type="application/pdf", headers=headers)
+
+
 if __name__ == "__main__":
     import sys
-    
+
     port = 8001
     if len(sys.argv) > 1:
         try:
